@@ -1,8 +1,11 @@
 import { WebSocketServer } from "ws";
 import mongoose from "mongoose";
+import fetch from "node-fetch";
+import dotenv from "dotenv"
+dotenv.config();
 
 // ✅ MongoDB Connection Setup
-const DB_URI = "mongodb://localhost:27017/starknet_game";
+const DB_URI = process.env.DB_URI;
 
 async function connectDB() {
     try {
@@ -47,13 +50,10 @@ const Transaction = mongoose.model("Transaction", new mongoose.Schema({
 }));
 
 // ✅ WebSocket Servers
-const TRANSACTION_PORT = 8081;
-const STATS_PORT = 8082;
+const TRANSACTION_PORT = process.env.TRANSACTION_PORT;
+const STATS_PORT = process.env.STATS_PORT;
 
-// **Transaction WebSocket**
-import fetch from "node-fetch";
-
-const TRANSACTION_API_URL = "https://madara-apex-htps-demo.karnot.xyz";
+const TRANSACTION_API_URL = process.env.TRANSACTION_API_URL;
 
 const EVENT_MAP = {
     "0x2cd0383e81a65036ae8acc94ac89e891d1385ce01ae6cc127c27615f5420fa3": "SpawnedBot",
@@ -73,6 +73,9 @@ class TransactionManager {
         this.isFetching = false;
         this.connectedClients = new Set();
         this.pollInterval = null;
+        this.batchSize = 15; // 15 transactions per batch
+        this.batchInterval = 50; // Send batches every 25ms (40 batches per second)
+                                // This gives us 15*40 = 600 transactions per second
     }
 
     async fetchTransactions() {
@@ -112,57 +115,51 @@ class TransactionManager {
             }
 
             const transactions = result.result.events;
-            this.continuationToken = result.result.continuation_token;
+            
+            if (transactions.length > 0) {
+                this.continuationToken = result.result.continuation_token;
 
-            // Format and add new transactions to queue
-            const formattedTransactions = transactions.map(tx => ({
-                event_name: EVENT_MAP[tx.keys[0]] || "UnknownEvent",
-                data: tx.data,
-                timestamp: Date.now()
-            }));
+                const formattedTransactions = transactions.map(tx => ({
+                    event_name: EVENT_MAP[tx.keys[0]] || "TransferEvent",
+                    data: tx.data,
+                    timestamp: Date.now()
+                }));
 
-            this.transactionQueue.push(...formattedTransactions);
-
-            // Log status for debugging
-            console.log(`Fetched ${transactions.length} transactions. Queue size: ${this.transactionQueue.length}`);
-            console.log(`Continuation token: ${this.continuationToken}`);
+                this.transactionQueue.push(...formattedTransactions);
+                console.log(`Fetched ${transactions.length} transactions. Queue size: ${this.transactionQueue.length}`);
+                console.log(`Continuation token: ${this.continuationToken}`);
+            } else {
+                console.log("No new transactions found");
+            }
 
         } catch (error) {
             console.error("Error fetching transactions:", error);
-            // Reset continuation token on error to start fresh
-            this.continuationToken = null;
         } finally {
             this.isFetching = false;
         }
     }
 
     startPolling() {
-        // Clear any existing polling interval
         if (this.pollInterval) {
             clearInterval(this.pollInterval);
         }
 
-        // Start continuous polling
         const poll = async () => {
             await this.fetchTransactions();
             
-            // If queue is empty or getting low, fetch immediately
+            // If we have a small queue, fetch again immediately
             if (this.transactionQueue.length < 100) {
-                setTimeout(() => this.fetchTransactions(), 100);
+                setTimeout(() => this.fetchTransactions(), 50);
             }
         };
 
-        // Initial fetch
         poll();
-
-        // Set up regular polling interval
-        this.pollInterval = setInterval(poll, 2000);
+        this.pollInterval = setInterval(poll, 500);
     }
 
     startStreaming(ws) {
         this.connectedClients.add(ws);
         
-        // Start polling if this is the first client
         if (this.connectedClients.size === 1) {
             this.startPolling();
         }
@@ -171,8 +168,19 @@ class TransactionManager {
             if (!this.connectedClients.has(ws)) return;
 
             if (this.transactionQueue.length > 0) {
-                // Take a small batch (5-10 transactions) for more frequent updates
-                const batch = this.transactionQueue.splice(0, 5);
+                let currentBatchSize;
+                
+                if (this.transactionQueue.length > 10000) {
+                    currentBatchSize = 100; // Much larger batches to catch up
+                } else if (this.transactionQueue.length > 1000) {
+                    currentBatchSize = 50; // Larger batches when behind
+                } else if (this.transactionQueue.length > 500) {
+                    currentBatchSize = 25; // Moderately larger batches
+                } else {
+                    currentBatchSize = this.batchSize;
+                }
+                
+                const batch = this.transactionQueue.splice(0, currentBatchSize);
                 
                 try {
                     ws.send(JSON.stringify({
@@ -186,29 +194,30 @@ class TransactionManager {
                 }
             }
 
-            // Schedule next batch very quickly for smooth streaming
-            setTimeout(streamBatch, 50);
+            // Dynamic interval based on queue size
+            const interval = this.transactionQueue.length > 1000 ? 25 :
+                             this.transactionQueue.length > 500 ? 40 : this.batchInterval;
+                             
+            setTimeout(streamBatch, interval);
         };
 
-        // Start streaming
         streamBatch();
     }
 
     removeClient(ws) {
         this.connectedClients.delete(ws);
         
-        // Stop polling if no clients are connected
         if (this.connectedClients.size === 0) {
             if (this.pollInterval) {
                 clearInterval(this.pollInterval);
                 this.pollInterval = null;
             }
-            this.continuationToken = null; // Reset token
+            this.transactionQueue = [];
+            this.continuationToken = null;
         }
     }
 }
 
-// Create single instance of TransactionManager
 const transactionManager = new TransactionManager();
 
 // Set up WebSocket server
@@ -243,7 +252,7 @@ statsWSS.on("connection", (ws) => {
             const totalBots = await Bot.countDocuments({});
             const botsAlive = await Bot.countDocuments({ status: "alive" });
             const botsDead = totalBots - botsAlive;
-            const totalDiamondMines = await Mine.countDocuments({ mine_type: "Diamond" });
+            const diamondsMined = await Mine.countDocuments({ mine_type: "Diamond" });
             const totalTilesMined = await Mine.countDocuments({})
 
             const leaderboard = await Bot.aggregate([
@@ -254,7 +263,7 @@ statsWSS.on("connection", (ws) => {
 
             ws.send(JSON.stringify({
                 type: "stats",
-                data: { totalPlayers, totalBots, botsAlive, botsDead, totalDiamondMines, totalTilesMined, leaderboard }
+                data: { totalPlayers, totalBots, botsAlive, botsDead, diamondsMined, totalTilesMined, leaderboard }
             }));
         } catch (error) {
             console.error("❌ Error fetching stats:", error);
