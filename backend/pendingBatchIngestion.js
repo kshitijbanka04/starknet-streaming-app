@@ -1,5 +1,7 @@
 import { RpcProvider } from "starknet";
 import mongoose from "mongoose";
+import dotenv from "dotenv"
+dotenv.config();
 
 const TRANSACTION_API_URL = process.env.TRANSACTION_API_URL;
 const provider = new RpcProvider({ nodeUrl: TRANSACTION_API_URL });
