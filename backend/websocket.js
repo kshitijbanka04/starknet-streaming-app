@@ -1,10 +1,10 @@
 import { WebSocketServer } from "ws";
 import mongoose from "mongoose";
 import fetch from "node-fetch";
-import dotenv from "dotenv"
+import dotenv from "dotenv";
 dotenv.config();
 
-// ✅ MongoDB Connection Setup
+// MongoDB Connection Setup
 const DB_URI = process.env.DB_URI;
 
 async function connectDB() {
@@ -14,8 +14,7 @@ async function connectDB() {
             useUnifiedTopology: true,
             serverSelectionTimeoutMS: 5000,
         });
-        mongoose.set("bufferCommands", false);
-        mongoose.set("debug", true);
+        mongoose.set("debug", false); // Set to false in production to improve performance
         console.log("✅ MongoDB Connected");
     } catch (err) {
         console.error("❌ MongoDB Connection Error:", err);
@@ -25,7 +24,7 @@ async function connectDB() {
 
 await connectDB();
 
-// ✅ Schemas & Models
+// Schemas & Models
 const Bot = mongoose.model("Bot", new mongoose.Schema({
     bot_address: String,
     player: String,
@@ -49,10 +48,10 @@ const Transaction = mongoose.model("Transaction", new mongoose.Schema({
     timestamp: Date,
 }));
 
-// ✅ WebSocket Servers
+// WebSocket Servers
 const TRANSACTION_PORT = process.env.TRANSACTION_PORT;
 const STATS_PORT = process.env.STATS_PORT;
-
+const TILES_PORT = process.env.TILES_PORT || 3003; // New port for tile data
 const TRANSACTION_API_URL = process.env.TRANSACTION_API_URL;
 
 const EVENT_MAP = {
@@ -65,21 +64,24 @@ const EVENT_MAP = {
     "0x1d6a6a42fd13b206a721dbca3ae720621707ef3016850e2c5536244e5a7858a": "ReviveBot"
 };
 
-// Queue to store and send transactions in FIFO order
+// Memory-efficient TransactionManager with rate limiting
 class TransactionManager {
     constructor() {
         this.transactionQueue = [];
         this.continuationToken = null;
         this.isFetching = false;
-        this.connectedClients = new Set();
+        this.connectedClients = new Map(); // Changed to Map to store client-specific info
         this.pollInterval = null;
-        this.batchSize = 15; // 15 transactions per batch
-        this.batchInterval = 50; // Send batches every 25ms (40 batches per second)
-                                // This gives us 15*40 = 600 transactions per second
+        this.maxQueueSize = 5000; // Limit queue size to prevent memory issues
     }
 
-    async fetchTransactions() {
+    async fetchTransactions(limit = 200) {
         if (this.isFetching) return;
+        if (this.transactionQueue.length >= this.maxQueueSize) {
+            console.log(`Queue at capacity (${this.transactionQueue.length}). Skipping fetch.`);
+            return;
+        }
+
         this.isFetching = true;
 
         try {
@@ -90,7 +92,7 @@ class TransactionManager {
                 params: [{
                     from_block: "pending",
                     to_block: "pending",
-                    chunk_size: 1000
+                    chunk_size: limit
                 }]
             };
 
@@ -119,15 +121,17 @@ class TransactionManager {
             if (transactions.length > 0) {
                 this.continuationToken = result.result.continuation_token;
 
-                const formattedTransactions = transactions.map(tx => ({
-                    event_name: EVENT_MAP[tx.keys[0]] || "TransferEvent",
-                    data: tx.data,
-                    timestamp: Date.now()
-                }));
+                // Process only most recent transactions if queue getting too large
+                const formattedTransactions = transactions
+                    .slice(0, Math.min(transactions.length, this.maxQueueSize - this.transactionQueue.length))
+                    .map(tx => ({
+                        event_name: EVENT_MAP[tx.keys[0]] || "TransferEvent",
+                        data: tx.data,
+                        timestamp: Date.now()
+                    }));
 
                 this.transactionQueue.push(...formattedTransactions);
-                console.log(`Fetched ${transactions.length} transactions. Queue size: ${this.transactionQueue.length}`);
-                console.log(`Continuation token: ${this.continuationToken}`);
+                console.log(`Fetched ${formattedTransactions.length} transactions. Queue size: ${this.transactionQueue.length}`);
             } else {
                 console.log("No new transactions found");
             }
@@ -144,43 +148,45 @@ class TransactionManager {
             clearInterval(this.pollInterval);
         }
 
-        const poll = async () => {
-            await this.fetchTransactions();
-            
-            // If we have a small queue, fetch again immediately
-            if (this.transactionQueue.length < 100) {
-                setTimeout(() => this.fetchTransactions(), 50);
-            }
-        };
-
-        poll();
-        this.pollInterval = setInterval(poll, 500);
+        // Perform initial fetch
+        this.fetchTransactions();
+        
+        // Poll at a reasonable rate
+        this.pollInterval = setInterval(() => this.fetchTransactions(), 1000);
     }
 
-    startStreaming(ws) {
-        this.connectedClients.add(ws);
+    startStreaming(ws, clientId) {
+        // Store client info with rate limiting parameters
+        this.connectedClients.set(ws, {
+            id: clientId,
+            batchSize: 10,
+            nextBatchTime: Date.now(),
+            batchInterval: 100,
+            queueBacklog: [] // Client-specific queue for catching up
+        });
         
         if (this.connectedClients.size === 1) {
             this.startPolling();
         }
 
-        const streamBatch = () => {
-            if (!this.connectedClients.has(ws)) return;
+        this.sendBatchToClient(ws);
+    }
 
-            if (this.transactionQueue.length > 0) {
-                let currentBatchSize;
-                
-                if (this.transactionQueue.length > 10000) {
-                    currentBatchSize = 100; // Much larger batches to catch up
-                } else if (this.transactionQueue.length > 1000) {
-                    currentBatchSize = 50; // Larger batches when behind
-                } else if (this.transactionQueue.length > 500) {
-                    currentBatchSize = 25; // Moderately larger batches
-                } else {
-                    currentBatchSize = this.batchSize;
-                }
-                
-                const batch = this.transactionQueue.splice(0, currentBatchSize);
+    sendBatchToClient(ws) {
+        if (!this.connectedClients.has(ws) || ws.readyState !== 1) {
+            this.connectedClients.delete(ws);
+            return;
+        }
+
+        const clientInfo = this.connectedClients.get(ws);
+        const now = Date.now();
+        
+        // Check if it's time to send next batch
+        if (now >= clientInfo.nextBatchTime) {
+            // First check client's backlog
+            if (clientInfo.queueBacklog.length > 0) {
+                const batchSize = Math.min(clientInfo.queueBacklog.length, clientInfo.batchSize);
+                const batch = clientInfo.queueBacklog.splice(0, batchSize);
                 
                 try {
                     ws.send(JSON.stringify({
@@ -193,15 +199,43 @@ class TransactionManager {
                     return;
                 }
             }
+            // Then check main queue
+            else if (this.transactionQueue.length > 0) {
+                const batchSize = Math.min(this.transactionQueue.length, clientInfo.batchSize);
+                const batch = this.transactionQueue.splice(0, batchSize);
+                
+                try {
+                    ws.send(JSON.stringify({
+                        type: "transactions",
+                        data: batch
+                    }));
+                    
+                    // Update all other clients' backlogs
+                    for (const [otherWs, otherClientInfo] of this.connectedClients.entries()) {
+                        if (otherWs !== ws) {
+                            otherClientInfo.queueBacklog.push(...batch);
+                            // Cap backlog size to prevent memory issues
+                            if (otherClientInfo.queueBacklog.length > 1000) {
+                                otherClientInfo.queueBacklog = otherClientInfo.queueBacklog.slice(-1000);
+                            }
+                        }
+                    }
+                } catch (error) {
+                    console.error("Error sending to WebSocket:", error);
+                    this.connectedClients.delete(ws);
+                    return;
+                }
+            }
 
-            // Dynamic interval based on queue size
-            const interval = this.transactionQueue.length > 1000 ? 25 :
-                             this.transactionQueue.length > 500 ? 40 : this.batchInterval;
-                             
-            setTimeout(streamBatch, interval);
-        };
+            // Calculate next batch time based on queue length
+            const queueFactor = this.transactionQueue.length > 1000 ? 0.5 : 
+                               this.transactionQueue.length > 500 ? 0.7 : 1;
+            
+            clientInfo.nextBatchTime = now + (clientInfo.batchInterval * queueFactor);
+        }
 
-        streamBatch();
+        // Schedule next batch
+        setTimeout(() => this.sendBatchToClient(ws), 50);
     }
 
     removeClient(ws) {
@@ -218,26 +252,162 @@ class TransactionManager {
     }
 }
 
-const transactionManager = new TransactionManager();
+// TileManager for handling tile data efficiently
+class TileManager {
+    constructor() {
+        this.activeViewers = new Map(); // Maps client to their current active tile range
+        this.updateInterval = null;
+    }
 
-// Set up WebSocket server
+    // Get mine data for specific layer and tile range
+    async getTileData(layer, tileRange) {
+        try {
+            // Parse the tileRange string to get start and end IDs
+            const [rangeStart, rangeEnd] = tileRange.split('-').map(id => id.replace(/[()]/g, ''));
+            
+            console.log(`Range: ${rangeStart} to ${rangeEnd}`);
+            
+            // Get all the specific tile IDs in this range
+            const tileIds = [];
+            for (let i = parseInt(rangeStart); i <= parseInt(rangeEnd); i++) {
+                // Convert each individual tile ID to hex if needed
+                const hexTileId = "0x" + i.toString(16);
+                tileIds.push(hexTileId);
+            }
+            
+            console.log(`Looking for these specific tiles: ${tileIds}`);
+            
+            // Query the database for mines with these exact location values
+            const mines = await Mine.find({
+                location: { $in: tileIds }
+            }).lean();
+            
+            console.log(`Found ${mines.length} mines in the range`);
+            return mines;
+        } catch (error) {
+            console.error("Error fetching tile data:", error);
+            return [];
+        }
+    }
+
+    // Register a client for a specific layer and tile range
+    registerClient(ws, layer, tileRange) {
+        this.activeViewers.set(ws, { layer, tileRange, lastUpdate: Date.now() });
+        
+        // Start interval if this is the first client
+        if (this.activeViewers.size === 1) {
+            this.startUpdates();
+        }
+        
+        // Send initial data
+        this.sendInitialData(ws);
+    }
+    
+    async sendInitialData(ws) {
+        if (!this.activeViewers.has(ws)) return;
+        
+        const { layer, tileRange } = this.activeViewers.get(ws);
+        const tileData = await this.getTileData(layer, tileRange);
+        
+        try {
+            ws.send(JSON.stringify({
+                type: "tileData",
+                action: "initial",
+                layer,
+                tileRange,
+                data: tileData
+            }));
+        } catch (error) {
+            console.error("Error sending initial tile data:", error);
+            this.activeViewers.delete(ws);
+        }
+    }
+    
+    // Update tile range for an existing client
+    updateClientView(ws, layer, tileRange) {
+        if (this.activeViewers.has(ws)) {
+            this.activeViewers.set(ws, { layer, tileRange, lastUpdate: Date.now() });
+            this.sendInitialData(ws);
+        }
+    }
+    
+    // Start sending updates to all clients
+    startUpdates() {
+        if (this.updateInterval) {
+            clearInterval(this.updateInterval);
+        }
+        
+        this.updateInterval = setInterval(async () => {
+            // Process each client
+            for (const [ws, { layer, tileRange, lastUpdate }] of this.activeViewers.entries()) {
+                if (ws.readyState !== 1) {
+                    this.activeViewers.delete(ws);
+                    continue;
+                }
+                
+                try {
+                    // Find updates since last check
+                    const [rangeStart, rangeEnd] = tileRange.split('-').map(id => id.replace(/[()]/g, ''));
+                    
+                    const updates = await Mine.find({
+                        location: { $gte: rangeStart, $lte: rangeEnd },
+                        timestamp: { $gt: new Date(lastUpdate) }
+                    }).lean();
+                    
+                    if (updates.length > 0) {
+                        ws.send(JSON.stringify({
+                            type: "tileData",
+                            action: "update",
+                            layer,
+                            tileRange,
+                            data: updates
+                        }));
+                        
+                        // Update the last update time
+                        const viewerInfo = this.activeViewers.get(ws);
+                        viewerInfo.lastUpdate = Date.now();
+                        this.activeViewers.set(ws, viewerInfo);
+                    }
+                } catch (error) {
+                    console.error("Error sending tile updates:", error);
+                }
+            }
+        }, 1000); // Check for updates every second
+    }
+    
+    removeClient(ws) {
+        this.activeViewers.delete(ws);
+        
+        if (this.activeViewers.size === 0 && this.updateInterval) {
+            clearInterval(this.updateInterval);
+            this.updateInterval = null;
+        }
+    }
+}
+
+// Initialize managers
+const transactionManager = new TransactionManager();
+const tileManager = new TileManager();
+
+// Set up Transaction WebSocket server
 const transactionWSS = new WebSocketServer({ port: TRANSACTION_PORT });
 console.log(`🚀 Transaction WebSocket running on ws://localhost:${TRANSACTION_PORT}`);
 
+let clientCounter = 0;
 transactionWSS.on("connection", (ws) => {
-    console.log("📡 New Transaction WebSocket Connection");
+    const clientId = ++clientCounter;
+    console.log(`📡 New Transaction WebSocket Connection (Client #${clientId})`);
 
     // Start streaming for this client
-    transactionManager.startStreaming(ws);
+    transactionManager.startStreaming(ws, clientId);
 
     ws.on("close", () => {
-        console.log("🔴 Transaction WebSocket Disconnected");
+        console.log(`🔴 Transaction WebSocket Disconnected (Client #${clientId})`);
         transactionManager.removeClient(ws);
     });
 });
 
-
-// **Stats & Leaderboard WebSocket**
+// Set up Stats & Leaderboard WebSocket
 const statsWSS = new WebSocketServer({ port: STATS_PORT });
 console.log(`🚀 Stats & Leaderboard WebSocket running on ws://localhost:${STATS_PORT}`);
 
@@ -272,4 +442,49 @@ statsWSS.on("connection", (ws) => {
 
     const interval = setInterval(sendStatsAndLeaderboard, 2000);
     ws.on("close", () => clearInterval(interval));
+});
+
+// Set up Tile Data WebSocket Server
+const tilesWSS = new WebSocketServer({ port: TILES_PORT });
+console.log(`🚀 Tile Data WebSocket running on ws://localhost:${TILES_PORT}`);
+
+// In your WebSocket server file (websocket.js)
+// Inside the tilesWSS connection handler, add more detailed logging:
+
+tilesWSS.on("connection", (ws) => {
+    console.log("📡 New Tile Data WebSocket Connection");
+    
+    // Handle messages from client to update view
+    ws.on("message", (message) => {
+        try {
+            console.log("Received message from client:", message.toString());
+            const parsedMessage = JSON.parse(message);
+            console.log("Parsed message:", parsedMessage);
+            
+            const { action, layer, tileRange } = parsedMessage;
+            
+            if (action === "viewTiles" && layer && tileRange) {
+                console.log(`Client viewing Layer ${layer}, Tile Range: ${tileRange}`);
+                
+                // Register or update the client's view
+                if (tileManager.activeViewers.has(ws)) {
+                    console.log("Updating existing client view");
+                    tileManager.updateClientView(ws, layer, tileRange);
+                } else {
+                    console.log("Registering new client");
+                    tileManager.registerClient(ws, layer, tileRange);
+                }
+            } else {
+                console.log("Invalid or incomplete message:", parsedMessage);
+            }
+        } catch (error) {
+            console.error("Error processing message:", error, message.toString());
+        }
+    });
+    
+    // More detailed handling for close events
+    ws.on("close", (code, reason) => {
+        console.log(`🔴 Tile Data WebSocket Disconnected. Code: ${code}, Reason: ${reason}`);
+        tileManager.removeClient(ws);
+    });
 });
